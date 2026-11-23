@@ -1,71 +1,219 @@
-Markdown# llm-reasoning-sft-unsloth
+# LLM Reasoning Fine-Tuning with QLoRA, Unsloth & Ollama
 
-End-to-end QLoRA Supervised Fine-Tuning (SFT) of `Llama-3.2-3B-Instruct` on `ServiceNow-AI/R1-Distill-SFT` (`v0`) using Unsloth on a Tesla T4 GPU, with GGUF (`Q8_0`) quantization and local Ollama deployment.
+End-to-end Supervised Fine-Tuning (SFT) of **Llama-3.2-3B-Instruct** using QLoRA and Unsloth on a single NVIDIA Tesla T4 GPU. The project uses reasoning traces from `ServiceNow-AI/R1-Distill-SFT` (`v0`), trains lightweight LoRA adapters, exports the fine-tuned model to GGUF (`Q8_0`), and deploys it locally using Ollama.
+
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Objectives](#project-objectives)
+- [System Architecture](#system-architecture)
+- [Technology Stack](#technology-stack)
+- [Dataset Description](#dataset-description)
+- [Fine-Tuning Methodology](#fine-tuning-methodology)
+- [Training Configuration](#training-configuration)
+- [Training Results](#training-results)
+- [Inference and Evaluation](#inference-and-evaluation)
+- [Model Export and Ollama Deployment](#model-export-and-ollama-deployment)
+- [Project Structure](#project-structure)
+- [Installation and Execution](#installation-and-execution)
+- [Limitations and Engineering Observations](#limitations-and-engineering-observations)
+- [Future Improvements](#future-improvements)
 
 ---
 
 ## Project Overview
 
-Compact instruction-tuned language models often jump straight to direct answers without explicit intermediate verification steps. This project fine-tunes `unsloth/Llama-3.2-3B-Instruct` (`3,237,063,680` total parameters) on reasoning traces from `ServiceNow-AI/R1-Distill-SFT` (`v0`) to encourage structured, step-by-step reasoning (`<think>...</think>`) within the memory budget of a single NVIDIA Tesla T4 GPU (`14.563 GB` VRAM).
+Compact instruction-tuned language models can produce direct answers without consistently following structured reasoning patterns. This project explores whether a smaller language model can be adapted to produce more structured, step-by-step responses through supervised fine-tuning on distilled reasoning data.
 
-By freezing quantized base model weights and training only `24,313,856` adapter parameters (`0.75%` of total parameters) via `TRL.SFTTrainer` and Unsloth, the pipeline adapts reasoning behavior efficiently. Over `60` optimizer steps (effective batch size `8`, completed in `14m 35s` on a Tesla T4), training loss drops from `0.9101` at Step 1 to `0.4882` at Step 60, reaching a minimum logged loss of `0.3971` at Step 57. Afterward, the model saves LoRA adapters to `chintan-001-3B`, exports a merged `Q8_0` GGUF binary and Ollama `Modelfile` to `chintan-001-3B-GGUF_gguf`, and configures local serving via Ollama at `http://127.0.0.1:11434`.
+The base model, `unsloth/Llama-3.2-3B-Instruct`, contains approximately **3.24 billion parameters**. It is fine-tuned on the `ServiceNow-AI/R1-Distill-SFT` dataset using **4-bit Quantized Low-Rank Adaptation (QLoRA)**.
+
+Instead of updating all model parameters, the training pipeline freezes the quantized base model and updates only lightweight LoRA adapter weights.
+
+The complete workflow covers:
+
+1. Loading a pretrained Llama-3.2-3B-Instruct model in 4-bit precision.
+2. Preparing and formatting reasoning-oriented supervised training data.
+3. Injecting LoRA adapters into attention and MLP projection layers.
+4. Performing supervised fine-tuning using TRL's `SFTTrainer`.
+5. Evaluating the fine-tuned model through local inference.
+6. Saving the trained LoRA adapters.
+7. Exporting the model to GGUF (`Q8_0`) format.
+8. Deploying the exported model locally using Ollama.
+
+### Key Project Metrics
+
+| Metric | Value |
+|---|---|
+| Base Model | Llama-3.2-3B-Instruct |
+| Total Parameters | 3,237,063,680 |
+| Trainable Parameters | 24,313,856 |
+| Trainable Parameter Ratio | 0.75% |
+| Dataset | ServiceNow-AI/R1-Distill-SFT |
+| Dataset Configuration | v0 |
+| Training Examples Available | 171,647 |
+| Fine-Tuning Method | QLoRA + LoRA |
+| Quantization During Training | 4-bit |
+| GPU | NVIDIA Tesla T4 |
+| GPU VRAM | 14.563 GB |
+| Training Steps | 60 |
+| Effective Batch Size | 8 |
+| Training Duration | 14 minutes 35 seconds |
+| Initial Training Loss | 0.9101 |
+| Final Training Loss | 0.4882 |
+| Minimum Logged Training Loss | 0.3971 |
+| Export Format | GGUF Q8_0 |
+| Local Deployment | Ollama |
 
 ---
 
-## System Architecture & Pipeline
+## Project Objectives
+
+- Adapt a compact instruction-following model using reasoning-oriented supervised fine-tuning.
+- Understand parameter-efficient fine-tuning using QLoRA and LoRA.
+- Train a 3B parameter model within a single Tesla T4 GPU memory budget.
+- Explore reasoning-trace formatting and EOS-based sequence termination.
+- Monitor training loss and inspect inference behavior.
+- Serialize trained adapters and export a deployable GGUF model.
+- Run the fine-tuned model locally through Ollama.
+
+---
+
+## System Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. Quantized Base Model & LoRA Injection                                 │
-│    Backbone: unsloth/Llama-3.2-3B-Instruct (4-bit, max_seq_length=2048) │
-│    LoRA: r=16, lora_alpha=16, lora_dropout=0, bias="none"              │
-│    Targets: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,          │
-│    down_proj across 28 LlamaDecoderLayer blocks                          │
-│    Trainable Params: 24,313,856 / 3,237,063,680 (0.75%)                │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 2. Dataset Loading & Prompt Formatting                                   │
-│    Dataset: ServiceNow-AI/R1-Distill-SFT (config="v0", split="train")  │
-│    Scale: 171,647 rows across 3 Parquet shards (~555 MB)               │
-│    Template: Reflective system prompt + <problem> + thought + solution  │
-│    Stop Token: Appended tokenizer.eos_token to each formatted sample    │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 3. Supervised Fine-Tuning (TRL SFTTrainer + Unsloth)                     │
-│    Batching: per_device_train_batch_size=2, grad_accum=4 (eff. = 8)   │
-│    Schedule: max_steps=60, lr=2e-4 (linear, 5 warmup), adamw_8bit       │
-│    Runtime: 1x NVIDIA Tesla T4 (14.563 GB VRAM, FP16, 14m 35s)         │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 4. Inference Evaluation & GGUF / Ollama Export                           │
-│    Inference: FastLanguageModel.for_inference() + llama-3.1 template    │
-│    Adapters: chintan-001-3B/                                            │
-│    GGUF & Modelfile: Llama-3.2-3B-Instruct.Q8_0.gguf                    │
-│    Local Server: Ollama runtime on [http://127.0.0.1:11434](http://127.0.0.1:11434)               │
-└──────────────────────────────────────────────────────────────────────────┘
-Dataset Description (ServiceNow-AI/R1-Distill-SFT)This pipeline uses the v0 configuration (train split) of ServiceNow-AI/R1-Distill-SFT, a dataset containing reasoning traces distilled from DeepSeek-R1 across math and problem-solving prompts (171,647 training examples across three Parquet shards).   ColumnTypeDescriptionidstringUnique sample identifier (id_0, id_1, ...).   problemstringInput math or logical problem statement placed inside <problem>...</problem>.   reannotated_assistant_contentstringStep-by-step reasoning trace (<think>...</think>) followed by a structured walkthrough.   solutionstringStep-by-step derivation with the final answer formatted in \boxed{...}.   sourcestringSource subset label such as orca_math or synthetic_math.   verified / quality_metricsnull / metadataOptional evaluation metadata fields present in the dataset schema.   Formatting Functionformatting_prompts_func maps each example into a "text" field using dataset.map(..., batched=True) and appends tokenizer.eos_token so the model learns clean stopping boundaries.   PlaintextYou are a reflective assistant engaging in thorough, iterative reasoning, mimicking human stream-of-consciousness thinking. Your approach emphasizes exploration, self-doubt, and continuous refinement before coming up with an answer.
-<problem>
-{problem}
-</problem>
+                   PRETRAINED MODEL
+                          |
+                          v
+              Llama-3.2-3B-Instruct
+                          |
+                          v
+                4-Bit Quantization
+                   (QLoRA Loading)
+                          |
+                          v
+                LoRA Adapter Injection
+                          |
+             +------------+------------+
+             |                         |
+             v                         v
+       Attention Layers            MLP Layers
+       q_proj, k_proj              gate_proj
+       v_proj, o_proj              up_proj
+                                   down_proj
+             |                         |
+             +------------+------------+
+                          |
+                          v
+                  DATASET PIPELINE
+                          |
+                          v
+             ServiceNow-AI/R1-Distill-SFT
+                          |
+                          v
+                Prompt Formatting
+                          |
+                          v
+                 SUPERVISED SFT
+                          |
+                          v
+                 TRL SFTTrainer
+                   + Unsloth
+                          |
+                          v
+                Trained LoRA Adapters
+                          |
+                          v
+                Model Serialization
+                          |
+                          v
+                 GGUF Export (Q8_0)
+                          |
+                          v
+                   Ollama Runtime
+                          |
+                          v
+                Local Model Inference
+```
 
-{reannotated_assistant_content}
-{solution}<EOS_TOKEN>
-Fine-Tuning Methodology (QLoRA & Unsloth)Four-bit quantization (load_in_4bit=True) reduces memory demand so a 3.24B parameter model fits alongside gradients, activations, and optimizer states on a 14.563 GB NVIDIA Tesla T4 GPU (dtype=None selects FP16 with Bfloat16=False on T4).   Low-Rank Adaptation (LoRA) keeps base model weights $W_0$ frozen and trains low-rank decomposition matrices $A$ and $B$:   $$W' = W_0 + \frac{\alpha}{r}(A \cdot B)$$Using r=16, lora_alpha=16 ($\alpha/r = 1.0$), lora_dropout=0, bias="none", and use_gradient_checkpointing="unsloth", Unsloth patches q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, and down_proj across all 28 LlamaDecoderLayer blocks while updating only 24,313,856 parameters (0.75%).   Supervised fine-tuning runs through TRL.SFTTrainer with per_device_train_batch_size=2 and gradient_accumulation_steps=4 for an effective batch size of 8, using optim="adamw_8bit", learning_rate=2e-4, warmup_steps=5, lr_scheduler_type="linear", and weight_decay=0.01 across max_steps=60 (480 sequences).   Training Configuration & ResultsThe run executed on 1x NVIDIA Tesla T4 (14.563 GB VRAM, CUDA Capability 7.5) with Unsloth 2026.11.7, PyTorch 2.14.1+cu130, Transformers 5.17.0, and TRL SFTTrainer, finishing 60 steps in 14m 35s.   StepTraining LossNotesStep 10.910080Initial training step   Step 100.686514Early drop as reasoning structure is learned   Step 210.464000Dropped below 0.50   Step 450.434314Low loss point later in the run   Step 570.397131Lowest recorded loss during the 60-step run   Step 600.488191Final logged step (outputs/checkpoint-60 saved)   Inference Behavior & Error AnalysisPost-training inference ran via FastLanguageModel.for_inference(model) using the llama-3.1 chat template (max_new_tokens=1024, temperature=1.5, min_p=0.1) on the prompt "How many 'r's are present in 'strawberry'?".   The model adopted a reflective, step-by-step monologue ("Alright, let me try to figure out...", "Let me break it down...", "Let me recount...")[cite: 1]. However, it counted 2 'r's instead of 3 and hit the 1024-token limit during repeated self-checks because subword tokenizers do not split words into single characters, max_steps=60 is a short format-adaptation run, and temperature=1.5 increases generation drift[cite: 1]. In production systems, exact character counting or arithmetic is better offloaded to tool calling or Python execution alongside RAG rather than relying on token generation alone.Model Serialization, GGUF Conversion & Ollama DeploymentPython# Save LoRA adapters & tokenizer
-model.save_pretrained("chintan-001-3B")
-tokenizer.save_pretrained("chintan-001-3B")
+### Pipeline Stages
 
-# Merge to 16-bit & export GGUF (Q8_0) + Ollama Modelfile
-model.save_pretrained_gguf("chintan-001-3B-GGUF", tokenizer)
-Bash# Serve and run locally via Ollama
-ollama serve &
-ollama create chintan-001-3b -f chintan-001-3B-GGUF_gguf/Modelfile
-ollama run chintan-001-3b
-Repository Structure & SetupPlaintext.
-├── finetuningipynb.ipynb          # Colab notebook: QLoRA SFT, inference, GGUF export & Ollama setup
-├── README.md                      # Project documentation
-├── chintan-001-3B/                # Saved LoRA adapter weights & tokenizer files (if tracked)
-└── chintan-001-3B-GGUF_gguf/      # Exported Q8_0 GGUF artifact & Ollama Modelfile (if tracked)
-Install Unsloth and open finetuningipynb.ipynb in Google Colab with a Tesla T4 GPU runtime (Runtime -> Change runtime type -> T4 GPU) to run the cells sequentially[cite: 1].Bashpip install -q unsloth
+| Stage | Implementation |
+|---|---|
+| Base Model Loading | Unsloth FastLanguageModel |
+| Quantization | 4-bit loading |
+| Adapter Injection | LoRA |
+| Dataset Preparation | Hugging Face Datasets |
+| Prompt Formatting | Custom formatting function |
+| Fine-Tuning | TRL SFTTrainer |
+| Optimization | AdamW 8-bit |
+| Memory Optimization | Gradient checkpointing |
+| Inference | Unsloth FastLanguageModel |
+| Model Export | GGUF Q8_0 |
+| Deployment | Ollama |
+
+---
+
+## Technology Stack
+
+| Category | Tools / Technologies |
+|---|---|
+| Programming Language | Python |
+| Model Architecture | Llama-3.2-3B-Instruct |
+| Fine-Tuning | QLoRA, LoRA |
+| Fine-Tuning Framework | Unsloth |
+| Training Framework | Hugging Face TRL |
+| Model Hub | Hugging Face |
+| Dataset Processing | Hugging Face Datasets |
+| Deep Learning | PyTorch |
+| Model Utilities | Transformers |
+| GPU Acceleration | CUDA |
+| Optimizer | AdamW 8-bit |
+| Model Serialization | GGUF |
+| Quantization | 4-bit, Q8_0 |
+| Local Inference | Ollama |
+| Development Environment | Google Colab |
+
+---
+
+## Dataset Description
+
+**Dataset:** [`ServiceNow-AI/R1-Distill-SFT`](https://huggingface.co/datasets/ServiceNow-AI/R1-Distill-SFT)
+
+The project uses the `v0` configuration and the `train` split.
+
+The dataset contains reasoning-oriented examples distilled from DeepSeek-R1, covering mathematical and problem-solving tasks.
+
+### Dataset Specifications
+
+| Attribute | Description |
+|---|---|
+| Dataset Name | ServiceNow-AI/R1-Distill-SFT |
+| Configuration | v0 |
+| Split | train |
+| Available Examples | 171,647 |
+| Storage Format | Parquet |
+| Number of Parquet Shards | 3 |
+| Approximate Dataset Size | 555 MB |
+
+### Dataset Columns
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | String | Unique sample identifier |
+| `problem` | String | Mathematical or logical problem statement |
+| `reannotated_assistant_content` | String | Reasoning trace and structured walkthrough |
+| `solution` | String | Solution containing the final answer |
+| `source` | String | Source subset identifier |
+| `verified` | Metadata | Optional verification metadata |
+| `quality_metrics` | Metadata | Optional quality-related metadata |
+
+### Prompt Formatting
+
+Each training example is transformed into a structured conversational-style text sequence.
+
+The formatting function combines the problem statement, reasoning trace, and final solution.
+
+**Training prompt template:**
+
